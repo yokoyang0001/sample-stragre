@@ -7,6 +7,7 @@
 
 
 
+```
 curl -X POST \
   -H "Authorization: Bearer $(gcloud auth print-access-token)" \
   -H "Content-Type: application/json" \
@@ -20,6 +21,5 @@ curl -X POST \
       "top_p": 0.9,
       "max_output_tokens": 1024
     }
-  }' \
-
-
+  }' 
+```
