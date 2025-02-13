@@ -43,6 +43,17 @@ data = {
 # 最大リトライ回数
 MAX_RETRIES = 5
 
+def convert_messages_to_vertexai(messages):
+    converted = []
+    for message in messages:
+        if isinstance(message, SystemMessage):
+            converted.append({"role": "user", "parts": [{"text": message.content}]})  # SystemMessage も "user"
+        elif isinstance(message, HumanMessage):
+            converted.append({"role": "user", "parts": [{"text": message.content}]})
+        elif isinstance(message, AIMessage):
+            converted.append({"role": "model", "parts": [{"text": message.content}]})
+    return converted
+
 def call_gemini(retries=0):
     try:
         response = requests.post(ENDPOINT, headers=headers, json=data, stream=True, timeout=15)
