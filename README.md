@@ -129,3 +129,86 @@ curl -X POST \
     }
   }' 
 ```
+
+
+```
+import json
+import time
+import requests
+import google.auth
+from google.auth.transport.requests import Request
+
+# 🔹 Google 認証情報の取得
+credentials, project = google.auth.default()
+credentials.refresh(Request())
+
+# 🔹 Vertex AI のエンドポイント & モデル
+LOCATION = "asia-northeast1"
+MODEL_ID = "gemini-pro"
+ENDPOINT = f"https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{project}/locations/{LOCATION}/publishers/google/models/{MODEL_ID}:streamGenerateContent"
+
+# 🔹 API ヘッダー
+headers = {
+    "Authorization": f"Bearer {credentials.token}",
+    "Content-Type": "application/json"
+}
+
+# 🔹 リクエストデータ
+data = {
+    "model": MODEL_ID,
+    "contents": [{"role": "user", "parts": [{"text": "Geminiについて500字で教えて"}]}]
+}
+
+# 🔹 `CallbackManager` クラス（イベントごとに専用の `execute_*` メソッドを作成）
+class CallbackManager:
+    def execute_start(self):
+        """リクエスト開始時の処理"""
+        print("[INFO] リクエスト開始")
+
+    def execute_new_token(self, chunk, elapsed_time):
+        """LLM から新しいトークンを受信したときの処理"""
+        try:
+            decoded_chunk = json.loads(chunk.decode("utf-8"))
+            token = decoded_chunk.get("text", "")  # 受信したテキスト部分
+            print(f"[{elapsed_time:.2f}s] 受信トークン: {token}")
+        except json.JSONDecodeError:
+            self.execute_llm_error("無効なトークンを受信しました")
+
+    def execute_end(self):
+        """リクエスト完了時の処理"""
+        print("[INFO] リクエスト終了")
+
+    def execute_llm_error(self, error):
+        """LLM からのレスポンスエラー"""
+        print(f"[LLM ERROR] {error}")
+
+    def execute_chain_error(self, error):
+        """API 呼び出し全体のエラー"""
+        print(f"[CHAIN ERROR] {error}")
+
+# 🔹 `CallbackManager` のインスタンス作成
+callback_manager = CallbackManager()
+
+# 🔹 API リクエスト送信（ストリーミング対応）
+start_time = time.time()
+
+try:
+    callback_manager.execute_start()  # リクエスト開始
+
+    with requests.post(ENDPOINT, headers=headers, json=data, stream=True) as response:
+        if response.status_code != 200:
+            raise Exception(f"APIエラー: {response.status_code} {response.text}")
+
+        for chunk in response.iter_lines():
+            if chunk:
+                elapsed_time = time.time() - start_time
+                callback_manager.execute_new_token(chunk, elapsed_time)  # トークン受信
+
+    callback_manager.execute_end()  # リクエスト終了
+
+except requests.exceptions.RequestException as e:
+    callback_manager.execute_chain_error(str(e))
+except Exception as e:
+    callback_manager.execute_chain_error(str(e))
+
+```
