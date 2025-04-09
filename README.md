@@ -1,214 +1,165 @@
-# README.md
+# Azure OpenAI Embedding モデル移行計画書
 
+## 1. はじめに
 
+### 1.1 背景と目的
+現在、本番環境で稼働中のアプリケーションでは、Azure OpenAI の `text-embedding-ada-002` モデルを利用してEmbeddingを生成し、類似検索や情報推薦に活用しています。
+本計画は、これをより高精度かつ柔軟な次世代モデルである `text-embedding-3-small` または `text-embedding-3-large` に移行するための計画書です。
 
+### 1.2 対象システムと構成
+- バックエンド: Play Framework（Java 8）
+- フロントエンド: React
+- データベース: MySQL
+- 分析・ログ解析: Databricks
+- 現在のEmbedding用途: ドキュメント類似検索、質問応答
 
-```python
-import requests
-import google.auth
-from google.auth.transport.requests import Request
-import json
-import time
+### 1.3 本計画のスコープ
+- 新モデルのPoC評価
+- 並行運用を前提とした段階的移行
+- A/Bテストを含む効果検証
+- 本番環境への反映と切替
 
-# 認証トークンの取得
-credentials, _ = google.auth.default()
-credentials.refresh(Request())
-access_token = credentials.token
+---
 
-# Vertex AI エンドポイント
-PROJECT_ID = "your-project-id"
-LOCATION = "us-central1"
-MODEL_ID = "gemini-pro"
-ENDPOINT = f"https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_ID}:streamGenerateContent"
+## 2. 現行モデルと新モデルの比較
 
-# ヘッダー
-headers = {
-    "Authorization": f"Bearer {access_token}",
-    "Content-Type": "application/json",
-    "Accept": "text/event-stream"
+### 2.1 `text-embedding-ada-002` の概要
+- 次元数: 1536
+- 特徴: 高速・低コスト・中精度
+
+### 2.2 `embedding-3-small` / `embedding-3-large` の特徴
+| モデル | 次元数（デフォルト） | 圧縮対応 | 精度 | コスト |
+|--------|----------------------|------------|------|--------|
+| 3-small | 1536 または 256       | あり       | 高   | 中     |
+| 3-large | 3072 または 512       | あり       | 最高 | 高     |
+
+### 2.3 比較表
+- `embedding-3` シリーズは圧縮次元の指定が可能（例：dimensions=256）
+- 精度重視なら3-large、コストと性能バランス重視なら3-smallが推奨
+
+### 2.4 モデル選定基準
+- アプリの検索品質要求
+- API呼び出しコスト（課金単位）
+- 処理レイテンシ・ユーザー体感
+
+---
+
+## 3. 移行方針
+
+### 3.1 完全移行 vs 並行運用の比較
+| 方法 | 特徴 | メリット | デメリット |
+|------|------|-----------|-------------|
+| 完全移行 | 一括で新モデルに切替 | シンプルな構成 | 移行時のリスク高、再生成時間要 |
+| 並行運用 | 旧新モデルを共存させて段階切替 | 安全、段階的に移行可能 | 実装複雑、コスト増 |
+
+### 3.2 採用方針：並行運用 → 段階的移行 → 完全切替
+
+### 3.3 主な影響範囲とリスク
+- 類似検索の精度変化
+- ストレージ増（Embedding二重管理）
+- モデル切替による検索結果の揺らぎ
+
+---
+
+## 4. 技術対応概要
+
+### 4.1 データベース構造の変更
+```sql
+ALTER TABLE document_embeddings
+ADD COLUMN model_version VARCHAR(50) NOT NULL DEFAULT 'text-embedding-ada-002',
+ADD COLUMN embedding_new JSON NULL;
+```
+
+### 4.2 バックエンドのEmbeddingService抽象化
+- `EmbeddingService` インターフェースを定義し、モデルごとの実装を切替可能に
+
+### 4.3 Azure OpenAI API連携例
+```json
+{
+  "input": "テキスト",
+  "model": "text-embedding-3-small",
+  "dimensions": 256
 }
-
-# リクエストボディ
-data = {
-    "contents": [
-        {"role": "user", "parts": [{"text": "Tell me about machine learning."}]}
-    ],
-    "generationConfig": {
-        "temperature": 0.7,
-        "top_p": 0.9,
-        "max_output_tokens": 1024
-    }
-}
-
-# 最大リトライ回数
-MAX_RETRIES = 5
-
-def convert_messages_to_vertexai(messages):
-    converted = []
-    for message in messages:
-        if isinstance(message, SystemMessage):
-            converted.append({"role": "user", "parts": [{"text": message.content}]})  # SystemMessage も "user"
-        elif isinstance(message, HumanMessage):
-            converted.append({"role": "user", "parts": [{"text": message.content}]})
-        elif isinstance(message, AIMessage):
-            converted.append({"role": "model", "parts": [{"text": message.content}]})
-    return converted
-
-def call_gemini(retries=0):
-    try:
-        response = requests.post(ENDPOINT, headers=headers, json=data, stream=True, timeout=15)
-
-        # HTTP ステータスコードによるエラーハンドリング
-        if response.status_code == 400:
-            raise ValueError("400 Bad Request: リクエストデータを確認してください")
-        elif response.status_code == 401:
-            raise PermissionError("401 Unauthorized: 認証トークンが無効または期限切れです")
-        elif response.status_code == 403:
-            raise PermissionError("403 Forbidden: 権限が不足しています")
-        elif response.status_code == 404:
-            raise FileNotFoundError("404 Not Found: エンドポイント URL が間違っています")
-        elif response.status_code == 429:
-            retry_after = int(response.headers.get("Retry-After", 5))
-            print(f"429 Too Many Requests: {retry_after}秒後に再試行します")
-            time.sleep(retry_after)
-            return call_gemini(retries + 1)  # 再試行
-        elif response.status_code in [500, 503, 504]:
-            if retries < MAX_RETRIES:
-                wait_time = 2 ** retries  # 指数バックオフ
-                print(f"{response.status_code} エラー: {wait_time}秒後に再試行（{retries+1}/{MAX_RETRIES}）")
-                time.sleep(wait_time)
-                return call_gemini(retries + 1)  # 再試行
-            else:
-                raise ConnectionError(f"{response.status_code} サーバーエラー: 最大リトライ回数を超えました")
-
-        # ストリーミングレスポンスの処理
-        for line in response.iter_lines():
-            if line:
-                try:
-                    event_data = json.loads(line.decode("utf-8").replace("data: ", ""))
-                    print(event_data)  # ストリーミングデータ
-                except json.JSONDecodeError:
-                    print("JSON デコードエラー:", line.decode("utf-8"))
-
-    except requests.exceptions.Timeout:
-        if retries < MAX_RETRIES:
-            wait_time = 2 ** retries
-            print(f"タイムアウト発生。{wait_time}秒後に再試行（{retries+1}/{MAX_RETRIES}）")
-            time.sleep(wait_time)
-            return call_gemini(retries + 1)  # 再試行
-        else:
-            print("タイムアウトが続いたため、処理を中断します")
-
-    except requests.exceptions.ConnectionError:
-        print("ネットワークエラー: サーバーに接続できません")
-    except requests.exceptions.RequestException as e:
-        print(f"リクエストエラー: {e}")
-    except Exception as e:
-        print(f"予期しないエラー: {e}")
-
-# 実行
-call_gemini()
-
 ```
 
+### 4.4 再埋め込み処理（Databricks）
+- 再生成対象のデータをバッチで処理
+- 日次／夜間バッチで分割実行可能
 
+### 4.5 検索処理の切り替えロジック
+- `embedding_new` が存在する場合は新ベクトルで検索
+- 存在しない場合は旧ベクトルを使用
 
-```
-curl -X POST \
-  -H "Authorization: Bearer $(gcloud auth print-access-token)" \
-  -H "Content-Type: application/json" \
-  -H "Accept: text/event-stream" \
-  -d '{
-    "contents": [
-      {"role": "user", "parts": [{"text": "Tell me a long story."}]}
-    ],
-    "generationConfig": {
-      "temperature": 0.7,
-      "top_p": 0.9,
-      "max_output_tokens": 1024
-    }
-  }' 
-```
+---
 
+## 5. スケジュール計画（4週間）
 
-```
-import json
-import time
-import requests
-import google.auth
-from google.auth.transport.requests import Request
+| 週次 | フェーズ | 作業内容 | 担当 |
+|------|----------|----------|------|
+| Week 1 | 調査・準備 | PoC、構成調査、DB変更、DI化 | 常駐エンジニア＋リード |
+| Week 2 | 実装・テスト | API実装、並行検索ロジック、再生成バッチ開発 | 常駐エンジニア＋分析担当 |
+| Week 3 | 段階導入 | 新規データのみ新モデル使用、ログ収集、A/Bテスト開始 | リード＋開発＋分析 |
+| Week 4 | 完全移行 | 全件再生成、旧コード削除、ドキュメント整理 | 全体協力 |
 
-# 🔹 Google 認証情報の取得
-credentials, project = google.auth.default()
-credentials.refresh(Request())
+---
 
-# 🔹 Vertex AI のエンドポイント & モデル
-LOCATION = "asia-northeast1"
-MODEL_ID = "gemini-pro"
-ENDPOINT = f"https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{project}/locations/{LOCATION}/publishers/google/models/{MODEL_ID}:streamGenerateContent"
+## 6. A/Bテスト設計と評価方法
 
-# 🔹 API ヘッダー
-headers = {
-    "Authorization": f"Bearer {credentials.token}",
-    "Content-Type": "application/json"
-}
+### 6.1 概要
+- ユーザーをグループA/Bに分けてEmbeddingモデルを変更
+- 見た目は同一で検索結果のみ異なる
 
-# 🔹 リクエストデータ
-data = {
-    "model": MODEL_ID,
-    "contents": [{"role": "user", "parts": [{"text": "Geminiについて500字で教えて"}]}]
-}
+### 6.2 割当方法
+- CookieやUser IDで固定振り分け
+- 対象は最初は5〜10%、徐々に拡大
 
-# 🔹 `CallbackManager` クラス（イベントごとに専用の `execute_*` メソッドを作成）
-class CallbackManager:
-    def execute_start(self):
-        """リクエスト開始時の処理"""
-        print("[INFO] リクエスト開始")
+### 6.3 評価指標
+- ヒット件数、検索ランキングの一致率
+- CTR（クリック率）、再検索率、滞在時間
+- パフォーマンス（レスポンス時間）
+- コスト（API呼び出し・ストレージ）
 
-    def execute_new_token(self, chunk, elapsed_time):
-        """LLM から新しいトークンを受信したときの処理"""
-        try:
-            decoded_chunk = json.loads(chunk.decode("utf-8"))
-            token = decoded_chunk.get("text", "")  # 受信したテキスト部分
-            print(f"[{elapsed_time:.2f}s] 受信トークン: {token}")
-        except json.JSONDecodeError:
-            self.execute_llm_error("無効なトークンを受信しました")
+### 6.4 判断基準
+- 精度が向上している、もしくは同等以上であること
+- レイテンシやコストが許容範囲内であること
 
-    def execute_end(self):
-        """リクエスト完了時の処理"""
-        print("[INFO] リクエスト終了")
+---
 
-    def execute_llm_error(self, error):
-        """LLM からのレスポンスエラー"""
-        print(f"[LLM ERROR] {error}")
+## 7. 本番リリースと最終切り替え
 
-    def execute_chain_error(self, error):
-        """API 呼び出し全体のエラー"""
-        print(f"[CHAIN ERROR] {error}")
+### 7.1 Canaryリリース
+- A/Bテストから徐々に新モデルへ切替
 
-# 🔹 `CallbackManager` のインスタンス作成
-callback_manager = CallbackManager()
+### 7.2 再生成の一括実施
+- 夜間・週末バッチで再埋め込みを行い、完全移行
 
-# 🔹 API リクエスト送信（ストリーミング対応）
-start_time = time.time()
+### 7.3 旧モデルコードの削除とクリーンアップ
+- `embedding_old` カラム削除（任意）
+- 使用ライブラリやAPI設定の整理
 
-try:
-    callback_manager.execute_start()  # リクエスト開始
+---
 
-    with requests.post(ENDPOINT, headers=headers, json=data, stream=True) as response:
-        if response.status_code != 200:
-            raise Exception(f"APIエラー: {response.status_code} {response.text}")
+## 8. 運用・保守・ドキュメント整備
 
-        for chunk in response.iter_lines():
-            if chunk:
-                elapsed_time = time.time() - start_time
-                callback_manager.execute_new_token(chunk, elapsed_time)  # トークン受信
+### 8.1 モデル履歴の管理
+- モデルごとのバージョン履歴を記録
 
-    callback_manager.execute_end()  # リクエスト終了
+### 8.2 将来の更新対応
+- 同様の移行手順を踏襲可能に設計
 
-except requests.exceptions.RequestException as e:
-    callback_manager.execute_chain_error(str(e))
-except Exception as e:
-    callback_manager.execute_chain_error(str(e))
+### 8.3 手順書の整備
+- CI/CD連携手順、API設定例、モデル変更手順など
 
-```
+---
+
+## 9. 補足資料（Appendix）
+
+### 9.1 APIリクエスト例
+### 9.2 再埋め込みバッチの疑似コード
+### 9.3 A/Bテストのコードスニペット（Java/Databricks）
+### 9.4 コストシミュレーション例
+
+---
+
+以上。
+
